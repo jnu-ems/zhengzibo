@@ -1,0 +1,97 @@
+/* 
+ * 郑梓博 - STM32 ADC 采样与 FreeRTOS 学习代码 (第四周)
+ * 核心功能：ADC 采样、滑动平均滤波、电压转换、阈值判断、队列通信、串口上报
+ */
+
+// 5.1 数据结构与队列
+typedef struct {
+    uint16_t raw_value;
+    float voltage;
+    uint8_t status;   // 0:正常,1:欠压,2:过压
+} BatteryData_t;
+
+QueueHandle_t xBatteryQueue;
+
+// 5.2 滑动平均滤波函数
+#define WINDOW_SIZE 10
+static uint16_t buf[WINDOW_SIZE];
+static uint8_t idx = 0;
+static uint32_t sum = 0;
+static uint8_t ready = 0;
+
+uint16_t MovingAverage(uint16_t new_sample) {
+    if (!ready) {
+        for (int i = 0; i < WINDOW_SIZE; i++) {
+            buf[i] = new_sample;
+            sum += new_sample;
+        }
+        ready = 1;
+        return new_sample;
+    }
+    sum -= buf[idx];
+    buf[idx] = new_sample;
+    sum += new_sample;
+    idx = (idx + 1) % WINDOW_SIZE;
+    return sum / WINDOW_SIZE;
+}
+
+// 5.3 ADCTask 实现
+void vADCTask(void *pvParameters) {
+    BatteryData_t data;
+    uint16_t adc_val, filtered;
+    while (1) {
+        HAL_ADC_Start(&hadc1);
+        if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK) {
+            adc_val = HAL_ADC_GetValue(&hadc1);
+            filtered = MovingAverage(adc_val);
+            data.raw_value = filtered;
+            data.voltage = (float)filtered * 3.3f / 4095.0f * 2.0f;  // 分压系数2
+            data.status = (data.voltage > 4.2f) ? 2 : ((data.voltage < 3.0f) ? 1 : 0);
+            xQueueOverwrite(xBatteryQueue, &data);
+        }
+        HAL_ADC_Stop(&hadc1);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+// 5.4 ReportTask 实现（串口输出）
+void vReportTask(void *pvParameters) {
+    BatteryData_t data;
+    char msg[64];
+    while (1) {
+        if (xQueueReceive(xBatteryQueue, &data, portMAX_DELAY)) {
+            sprintf(msg, "ADC:%4u  Voltage:%.2fV  Status:%s\r\n",
+                    data.raw_value, data.voltage,
+                    data.status == 0 ? "Normal" : (data.status == 1 ? "Under" : "Over"));
+            HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+// main 函数中创建队列和任务的示例
+/*
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_ADC1_Init(); // 初始化 ADC
+    MX_USART1_UART_Init();
+    
+    // 创建电池数据队列
+    xBatteryQueue = xQueueCreate(1, sizeof(BatteryData_t)); // 队列长度为1，使用 xQueueOverwrite
+    
+    // 创建 FreeRTOS 任务
+    osThreadDef(ADCTask, vADCTask, osPriorityNormal, 0, 256);
+    osThreadCreate(osThread(ADCTask), NULL);
+    
+    osThreadDef(ReportTask, vReportTask, osPriorityAboveNormal, 0, 256);
+    osThreadCreate(osThread(ReportTask), NULL);
+    
+    // 启动调度器
+    osKernelStart();
+    
+    for (;;) {}
+}
+*/
